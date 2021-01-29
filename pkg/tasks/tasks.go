@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 
+	"github.com/go-kit/kit/log/level"
+
+	"github.com/grafana/go-mod-promote/pkg/command"
 	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
 	gmperr "github.com/grafana/go-mod-promote/pkg/errors"
 )
@@ -23,16 +25,14 @@ type Patch struct {
 	Body []byte
 }
 
-func (p *Patch) Apply() error {
-	c := exec.Command("patch", "-p", "1")
+func (p *Patch) Apply(ctx context.Context) error {
+	c := command.New(ctx, "patch", "-p", "1")
 	var stdout = new(bytes.Buffer)
 	var stderr = new(bytes.Buffer)
 	stdin, err := c.StdinPipe()
 	if err != nil {
 		return err
 	}
-	c.Stderr = stderr
-	c.Stdout = stdout
 	if err := c.Start(); err != nil {
 		return err
 	}
@@ -58,13 +58,13 @@ type Copy struct {
 	Destination string // relative path to root
 }
 
-func (c *Copy) Apply() error {
+func (c *Copy) Apply(ctx context.Context) error {
 	return nil
 }
 
 type Delete string
 
-func (d Delete) Apply() error {
+func (d Delete) Apply(ctx context.Context) error {
 	return nil
 }
 
@@ -89,10 +89,12 @@ func (r *Result) IsEmpty() bool {
 	return true
 }
 
-func (r *Result) Apply() error {
+func (r *Result) Apply(ctx context.Context) error {
+	logger := gmpctx.LoggerFromContext(ctx)
+
 	for pos, patch := range r.Patches {
-		if err := patch.Apply(); err != nil {
-			log.Printf("applied Patch[%d] successfully", pos)
+		if err := patch.Apply(ctx); err != nil {
+			level.Info(logger).Log("msg", fmt.Sprintf("applied Patch[%d] successfully", pos))
 		}
 	}
 
@@ -175,6 +177,7 @@ type TaskRegexp struct {
 }
 
 func (t *TaskRegexp) run(ctx context.Context) (*Result, error) {
+	logger := gmpctx.LoggerFromContext(ctx)
 
 	sourceRe, err := regexp.Compile(t.Source.Regexp)
 	if err != nil {
@@ -194,7 +197,7 @@ func (t *TaskRegexp) run(ctx context.Context) (*Result, error) {
 	}
 
 	for pos := range m {
-		log.Printf("regexp '%s' submatches[%d]: '%s'", sourceRe, pos, m[pos])
+		level.Debug(logger).Log("msg", fmt.Sprintf("regexp '%s' submatches[%d]: '%s'", sourceRe, pos, m[pos]))
 	}
 
 	return nil, nil
@@ -218,16 +221,11 @@ func (t *TaskDiff) run(ctx context.Context) (*Result, error) {
 	before := gmpctx.GoModBeforeFromContext(ctx)
 	after := gmpctx.GoModAfterFromContext(ctx)
 
-	var stdout = new(bytes.Buffer)
-	var stderr = new(bytes.Buffer)
-
-	cmd := exec.Command("diff",
+	cmd := command.New(ctx, "diff",
 		"-u",
 		filepath.Join(before.Dir, t.Source),
 		filepath.Join(after.Dir, t.Source),
 	)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
 
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
@@ -238,7 +236,7 @@ func (t *TaskDiff) run(ctx context.Context) (*Result, error) {
 
 	var diff []byte
 
-	scanner := bufio.NewScanner(stdout)
+	scanner := bufio.NewScanner(&cmd.Stdout)
 	for scanner.Scan() {
 		b := scanner.Bytes()
 		var path string
@@ -347,7 +345,8 @@ func (t *TaskSyncDirectory) walkDirectory(dirPath string, m map[string]string) e
 }
 
 func (t *TaskSyncDirectory) run(ctx context.Context) (*Result, error) {
-	log.Printf("sync from %s to %s", t.Source, t.Destination)
+	logger := gmpctx.LoggerFromContext(ctx)
+	level.Info(logger).Log("msg", "sync task", "source", t.Source, "destination", t.Destination)
 
 	after := gmpctx.GoModAfterFromContext(ctx)
 

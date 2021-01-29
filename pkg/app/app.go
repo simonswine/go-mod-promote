@@ -1,12 +1,10 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -17,6 +15,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/grafana/go-mod-promote/pkg/api"
+	"github.com/grafana/go-mod-promote/pkg/command"
 	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
 	"github.com/grafana/go-mod-promote/pkg/tasks"
 )
@@ -24,33 +23,15 @@ import (
 const configFile = ".go-mod-promote.yaml"
 const AppName = "go-mod-promote"
 
-func goMod(ctx context.Context, args ...string) *exec.Cmd {
-
-	logger := gmpctx.LoggerFromContext(ctx)
-
-	exe := "go"
-	args = append([]string{"mod"}, args...)
-
-	logger.Log("msg", "execute go mod", "command", append([]string{exe}, args...))
-	return exec.Command(
-		exe,
-		args...,
-	)
-}
-
 func goModDownload(ctx context.Context, path string) (*api.GoModDownloadResult, error) {
-	cmd := goMod(ctx, "download", "-json", path)
-	stdout := bytes.Buffer{}
-	cmd.Stdout = &stdout
-	stderr := bytes.Buffer{}
-	cmd.Stderr = &stderr
+	cmd := command.New(ctx, "go", "mod", "download", "-json", path)
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("error getting go mod download metadata (%s): %w", stderr.String(), err)
+		return nil, fmt.Errorf("error getting go mod download metadata (%s): %w", cmd.Stderr.String(), err)
 	}
 	var result api.GoModDownloadResult
 
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(cmd.Stdout.Bytes(), &result); err != nil {
 		return nil, err
 	}
 
@@ -134,8 +115,7 @@ func New(opts ...Option) (*App, error) {
 
 func (a *App) ctx(ctx context.Context) context.Context {
 	ctx = gmpctx.RootPathIntoContext(ctx, a.rootPath)
-	//ctx = gmpctx.LoggerIntoContext(ctx, a.logger)
-
+	ctx = gmpctx.LoggerIntoContext(ctx, a.logger)
 	return ctx
 }
 
@@ -216,7 +196,7 @@ func (a *App) Run(ctx context.Context) error {
 		return nil
 	}
 
-	if err := result.Apply(); err != nil {
+	if err := result.Apply(ctx); err != nil {
 		return errors.Wrap(err, "error applying changes")
 	}
 
@@ -227,7 +207,7 @@ func (a *App) Run(ctx context.Context) error {
 	// TODO: exit here if there is nothing to do
 
 	// test if the git working dir is clean
-	workingDirClean, err := gitIsWorkingDirClean()
+	workingDirClean, err := gitIsWorkingDirClean(ctx)
 	if err != nil {
 		return err
 	}
@@ -237,6 +217,7 @@ func (a *App) Run(ctx context.Context) error {
 		level.Info(a.logger).Log("msg", "Stashing dirty working directory")
 
 		if err := gitCommand(
+			ctx,
 			"stash",
 			"push",
 			"-m", fmt.Sprintf(
@@ -249,7 +230,7 @@ func (a *App) Run(ctx context.Context) error {
 
 		// stash pop changes including unstaged
 		defer func() {
-			if err := gitCommand("stash", "pop").Run(); err != nil {
+			if err := gitCommand(ctx, "stash", "pop").Run(); err != nil {
 				level.Error(a.logger).Log("msg", "Failed to restore dirty working directory from stash", "error", err)
 			} else {
 				level.Info(a.logger).Log("msg", "Restored dirty working directory from stash")
@@ -260,19 +241,18 @@ func (a *App) Run(ctx context.Context) error {
 	return nil
 }
 
-func gitIsWorkingDirClean() (bool, error) {
-	out, err := gitCommand("status", "--porcelain").Output()
-	if err != nil {
-		return false, fmt.Errorf("Failed to gather git status: %w", err)
+func gitIsWorkingDirClean(ctx context.Context) (bool, error) {
+	cmd := gitCommand(ctx, "status", "--porcelain")
+	if err := cmd.Run(); err != nil {
+		return false, err
 	}
-
-	if len(out) > 0 {
+	if len(cmd.Stdout.String()) > 0 {
 		return false, nil
 	}
 
 	return true, nil
 }
 
-func gitCommand(args ...string) *exec.Cmd {
-	return exec.Command("git", args...)
+func gitCommand(ctx context.Context, args ...string) *command.Cmd {
+	return command.New(ctx, "git", args...)
 }
