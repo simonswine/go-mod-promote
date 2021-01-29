@@ -1,0 +1,21 @@
+---
+run:
+  build-tags:
+    - netgo
+    - requires_docker
+
+output:
+  format: line-number
+
+linters:
+  enable:
+    - goimports
+    - golint
+    - misspell
+    - gofmt
+
+linters-settings:
+  errcheck:
+    exclude: ./.errcheck-exclude
+  goimports:
+    local-prefixes: "github.com/grafana/go-mod-promote"
