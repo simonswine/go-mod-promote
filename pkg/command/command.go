@@ -3,6 +3,7 @@ package command
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 
@@ -15,9 +16,10 @@ import (
 type Cmd struct {
 	*exec.Cmd
 
-	logger log.Logger
-	Stdout bytes.Buffer
-	Stderr bytes.Buffer
+	logger   log.Logger
+	ExitCode int
+	Stdout   bytes.Buffer
+	Stderr   bytes.Buffer
 }
 
 func New(ctx context.Context, command string, args ...string) *Cmd {
@@ -47,7 +49,13 @@ func (c *Cmd) Wait() error {
 	err := c.Cmd.Wait()
 	logger := c.logger
 	if err != nil {
-		logger = log.With(logger, "err", err)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			c.ExitCode = exitErr.ExitCode()
+			logger = log.With(logger, "exit_code", exitErr.ExitCode())
+		} else {
+			logger = log.With(logger, "err", err)
+		}
 	}
 	level.Debug(logger).Log("msg", "Finished execution")
 	return err

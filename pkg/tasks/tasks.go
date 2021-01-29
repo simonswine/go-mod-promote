@@ -15,6 +15,7 @@ import (
 	"regexp"
 
 	"github.com/go-kit/kit/log/level"
+	"github.com/hashicorp/go-multierror"
 
 	"github.com/grafana/go-mod-promote/pkg/command"
 	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
@@ -25,10 +26,33 @@ type Patch struct {
 	Body []byte
 }
 
+type PatchError struct {
+	Upstream error
+	Reject   []byte
+	msg      string
+}
+
+func (p *PatchError) Error() string {
+	return p.msg
+}
+
 func (p *Patch) Apply(ctx context.Context) error {
-	c := command.New(ctx, "patch", "-p", "1")
-	var stdout = new(bytes.Buffer)
-	var stderr = new(bytes.Buffer)
+	logger := gmpctx.LoggerFromContext(ctx)
+
+	rejectFile, err := ioutil.TempFile("", "reject")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(rejectFile.Name())
+	if err := rejectFile.Close(); err != nil {
+		return err
+	}
+
+	c := command.New(ctx, "patch",
+		"--strip", "1", // remove the first directory of the patch paths
+		"--reject-file", rejectFile.Name(), // if patch doesn't apply, parts that did not work are stored there
+		"--no-backup-if-mismatch", // avoid backing up the original files
+	)
 	stdin, err := c.StdinPipe()
 	if err != nil {
 		return err
@@ -45,10 +69,28 @@ func (p *Patch) Apply(ctx context.Context) error {
 	}
 
 	if err := c.Wait(); err != nil {
-		return fmt.Errorf("error applying patch: %w stdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
-	}
+		err = fmt.Errorf("error applying patch: %w stdout=[%s] stderr=[%s]", err, c.Stdout.String(), c.Stderr.String())
+		if c.ExitCode == 1 {
+			rejectBody, rerr := ioutil.ReadFile(rejectFile.Name())
+			if rerr != nil {
+				level.Warn(logger).Log("msg", "Unable to read rejects file", "err", rerr)
+				// return original patch error
+				return err
+			}
 
-	// TODO needs better handling if rejected
+			if len(rejectBody) == 0 {
+				return err
+			}
+
+			return &PatchError{
+				Upstream: err,
+				Reject:   rejectBody,
+				msg:      c.Stdout.String(),
+			}
+
+		}
+		return err
+	}
 
 	return nil
 }
@@ -59,13 +101,44 @@ type Copy struct {
 }
 
 func (c *Copy) Apply(ctx context.Context) error {
-	return nil
+	sourceFileStat, err := os.Stat(c.Source)
+	if err != nil {
+		return err
+	}
+
+	if !sourceFileStat.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", c.Source)
+	}
+
+	source, err := os.Open(c.Source)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	destination, err := os.Create(c.Destination)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+	_, err = io.Copy(destination, source)
+	return err
 }
 
 type Delete string
 
 func (d Delete) Apply(ctx context.Context) error {
-	return nil
+	filePath := string(d)
+	fileStat, err := os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+
+	if !fileStat.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", filePath)
+	}
+
+	return os.Remove(filePath)
 }
 
 type Result struct {
@@ -92,19 +165,33 @@ func (r *Result) IsEmpty() bool {
 func (r *Result) Apply(ctx context.Context) error {
 	logger := gmpctx.LoggerFromContext(ctx)
 
+	var result error
+
 	for pos, patch := range r.Patches {
 		if err := patch.Apply(ctx); err != nil {
-			level.Info(logger).Log("msg", fmt.Sprintf("applied Patch[%d] successfully", pos))
+			result = multierror.Append(result, err)
+			continue
 		}
+		level.Info(logger).Log("msg", fmt.Sprintf("applied Patch[%d] successfully", pos))
 	}
 
-	//for pos, patch := range r.Patches {
-	//	if err := patch.Apply(); err != nil {
-	//		log.Printf("applied Patch[%d] successfully", pos)
-	//	}
-	//}
+	for _, toDelete := range r.FilesToDelete {
+		if err := toDelete.Apply(ctx); err != nil {
+			result = multierror.Append(result, err)
+			continue
+		}
+		level.Info(logger).Log("msg", fmt.Sprintf("deleted '%s' successfully", toDelete))
+	}
 
-	return nil
+	for _, toCopy := range r.FilesToCopy {
+		if err := toCopy.Apply(ctx); err != nil {
+			result = multierror.Append(result, err)
+			continue
+		}
+		level.Info(logger).Log("msg", fmt.Sprintf("copied '%s' successfully", toCopy))
+	}
+
+	return result
 }
 
 func AggregateResult(results ...*Result) *Result {

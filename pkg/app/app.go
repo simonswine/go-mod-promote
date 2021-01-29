@@ -11,6 +11,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	logkit "github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 
@@ -176,37 +177,31 @@ func (a *App) Run(ctx context.Context) error {
 
 		result = tasks.AggregateResult(append(results, result)...)
 
-		/*
-			var existingModule *modfile.Require
-			for _, module := range goMod.Require {
-				if module.Mod.Path == pkg {
-					existingModule = module
-				}
-			}
-
-			if existingModule == nil {
-				return fmt.Errorf("package not found in go.mod: %s", pkg)
-			}
-
-		*/
 	}
 
+	// exit here if there is nothing to do
+	// TODO: also check for go mod changes
 	if result.IsEmpty() {
 		level.Info(a.logger).Log("msg", "No changes necessary")
 		return nil
 	}
 
+	level.Debug(a.logger).Log("results", spew.Sdump(result))
+
+	// TODO: apply go mod, fail if not successful
+
+	// apply changes incurred by tasks
 	if err := result.Apply(ctx); err != nil {
+		if merr, ok := err.(*multierror.Error); ok {
+			for pos, err := range merr.Errors {
+				level.Warn(a.logger).Log("msg", "error applying result", "pos", pos, "err", err)
+			}
+		}
 		return errors.Wrap(err, "error applying changes")
 	}
 
-	level.Debug(a.logger).Log("results", spew.Sdump(result))
-
-	// TODO: aggregate results
-
-	// TODO: exit here if there is nothing to do
-
 	// test if the git working dir is clean
+	// TODO: move this up
 	workingDirClean, err := gitIsWorkingDirClean(ctx)
 	if err != nil {
 		return err
@@ -237,6 +232,14 @@ func (a *App) Run(ctx context.Context) error {
 			}
 		}()
 	}
+
+	// TODO: Create a git commit with changes
+
+	// TODO: Roll backup git commit in dry-run mode
+
+	// TODO: Push commit
+
+	// TODO: Create PR
 
 	return nil
 }
