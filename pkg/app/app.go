@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/grafana/go-mod-promote/pkg/api"
 	"github.com/grafana/go-mod-promote/pkg/command"
 	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
+	"github.com/grafana/go-mod-promote/pkg/github"
 	"github.com/grafana/go-mod-promote/pkg/tasks"
 )
 
@@ -41,6 +43,12 @@ func goModDownload(ctx context.Context, path string) (*api.GoModDownloadResult, 
 
 type Config struct {
 	Packages map[string]Package
+	GitHub   GitHub
+}
+
+type GitHub struct {
+	Owner string
+	Repo  string
 }
 
 type Package struct {
@@ -123,6 +131,9 @@ func (a *App) ctx(ctx context.Context) context.Context {
 func (a *App) Run(ctx context.Context) error {
 	level.Debug(a.logger).Log("running_config", spew.Sdump(a.cfg))
 	ctx = a.ctx(ctx)
+
+	// TODO: test github token if not a
+	githubToken := os.Getenv("GITHUB_TOKEN")
 
 	//
 	/*
@@ -233,13 +244,54 @@ func (a *App) Run(ctx context.Context) error {
 		}()
 	}
 
-	// TODO: Create a git commit with changes
+	// create a new branch
+	branchName := fmt.Sprintf(
+		"vendor_go-mod-promote_%s",
+		time.Now().Format("2006-01-02_150405"),
+	)
+	if err := gitCommand(ctx, "checkout", "-b", branchName).Run(); err != nil {
+		return err
+	}
 
-	// TODO: Roll backup git commit in dry-run mode
+	// create a git commit with changes
+	if err := gitCommand(ctx, "add", "-A", ".").Run(); err != nil {
+		return err
+	}
 
-	// TODO: Push commit
+	// TODO: Handle no changes
+	if err := gitCommand(ctx, "commit", "--message", "chore: Update vendor", "--author", "Grafanabot go-mod-vendor <bot@grafana.com>", "--allow-empty").Run(); err != nil {
+		return err
+	}
 
-	// TODO: Create PR
+	// figure out github user
+	gh := github.New(ctx, githubToken)
+	githubUsername, err := gh.Username(ctx)
+	if err != nil {
+		return err
+	}
+
+	// push commit
+	githubURL := &url.URL{
+		Host:   "github.com",
+		Scheme: "https",
+		Path:   fmt.Sprintf("/%s/%s.git", a.cfg.GitHub.Owner, a.cfg.GitHub.Repo),
+		User:   url.UserPassword(githubUsername, githubToken),
+	}
+	if err := gitCommand(ctx, "push", githubURL.String(), branchName).Run(); err != nil {
+		return err
+	}
+
+	// create PR
+	baseBranch := "main"
+	title := fmt.Sprintf("[go-mod-promote] Vendor update %s", strings.Join(packagesUpdated, ", "))
+	_, err = gh.CreatePR(ctx, a.cfg.GitHub.Owner, a.cfg.GitHub.Repo, &github.NewPullRequest{
+		Base:  &baseBranch,
+		Head:  &branchName,
+		Title: &title,
+	})
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
