@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
@@ -20,6 +21,7 @@ import (
 	"github.com/grafana/go-mod-promote/pkg/command"
 	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
 	"github.com/grafana/go-mod-promote/pkg/github"
+	"github.com/grafana/go-mod-promote/pkg/gomod"
 	"github.com/grafana/go-mod-promote/pkg/tasks"
 )
 
@@ -42,8 +44,13 @@ func goModDownload(ctx context.Context, path string) (*api.GoModDownloadResult, 
 }
 
 type Config struct {
-	Packages map[string]Package
-	GitHub   GitHub
+	Packages map[string]Package `yaml:"packages"`
+
+	GitHub GitHub `yaml:"github"`
+
+	// If VendorDirectory is set to true, go mod vendor will be called after
+	// changes to vendoring
+	VendorDirectory bool `yaml:"vendor_directory"`
 }
 
 type GitHub struct {
@@ -128,6 +135,26 @@ func (a *App) ctx(ctx context.Context) context.Context {
 	return ctx
 }
 
+type Result interface {
+	IsEmpty() bool
+	Apply(context.Context) error
+}
+
+type goModUpdateResult struct {
+	goMod     *gomod.GoMod
+	pkg       string
+	remoteURL string
+	version   string
+}
+
+func (r *goModUpdateResult) Apply(ctx context.Context) error {
+	return r.goMod.UpdatePackage(r.pkg, r.version)
+}
+
+func (r *goModUpdateResult) IsEmpty() bool {
+	return false
+}
+
 func (a *App) Run(ctx context.Context) error {
 	level.Debug(a.logger).Log("running_config", spew.Sdump(a.cfg))
 	ctx = a.ctx(ctx)
@@ -135,21 +162,14 @@ func (a *App) Run(ctx context.Context) error {
 	// TODO: test github token if not a
 	githubToken := os.Getenv("GITHUB_TOKEN")
 
-	//
-	/*
-		goModPath := filepath.Join(a.rootPath, "go.mod")
-		goModBytes, err := ioutil.ReadFile(goModPath)
-		if err != nil {
-			return err
-		}
+	goMod, err := gomod.NewGoModFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	ctx = gmpctx.GoModFileIntoContext(ctx, goMod)
 
-		goMod, err := modfile.ParseLax("go.mod", goModBytes, nil)
-		if err != nil {
-			return err
-		}
-	*/
-
-	var result = &tasks.Result{}
+	var results []Result
+	var packagesUpdated []string
 	for pkg, cfg := range a.cfg.Packages {
 		modBefore, err := goModDownload(ctx, pkg)
 		if err != nil {
@@ -170,49 +190,50 @@ func (a *App) Run(ctx context.Context) error {
 			return err
 		}
 		level.Info(a.logger).Log("msg", "new package version for go.mod", "package", pkg, "version", modAfter.Version.Release(), "hash", modAfter.Version.Hash())
+		ctx = gmpctx.GoModAfterIntoContext(ctx, modAfter)
 
 		if modBefore.Version == modAfter.Version {
 			level.Info(a.logger).Log("msg", "versions matching nothing to do", "package", pkg)
-			return nil
+			continue
 		}
 
-		ctx = gmpctx.GoModAfterIntoContext(ctx, modAfter)
-		var results = make([]*tasks.Result, len(cfg.Tasks))
+		packagesUpdated = append(packagesUpdated, pkg)
+
+		var taskResults = make([]*tasks.Result, len(cfg.Tasks))
 		for pos, task := range cfg.Tasks {
 			var err error
-			results[pos], err = task.Run(ctx)
+			taskResults[pos], err = task.Run(ctx)
 			if err != nil {
 				return err
 			}
 		}
 
-		result = tasks.AggregateResult(append(results, result)...)
-
+		// add results to global results
+		results = append(results,
+			&goModUpdateResult{
+				goMod:     goMod,
+				pkg:       pkg,
+				remoteURL: cfg.RemoteURL,
+				version:   modAfter.Version.Hash(),
+			},
+			tasks.AggregateResult(taskResults...),
+		)
 	}
 
 	// exit here if there is nothing to do
 	// TODO: also check for go mod changes
-	if result.IsEmpty() {
+	workToDo := false
+	for _, r := range results {
+		if !r.IsEmpty() {
+			workToDo = true
+		}
+	}
+	if !workToDo {
 		level.Info(a.logger).Log("msg", "No changes necessary")
 		return nil
 	}
 
-	level.Debug(a.logger).Log("results", spew.Sdump(result))
-
-	// TODO: apply go mod, fail if not successful
-
-	// apply changes incurred by tasks
-	if err := result.Apply(ctx); err != nil {
-		if merr, ok := err.(*multierror.Error); ok {
-			for pos, err := range merr.Errors {
-				level.Warn(a.logger).Log("msg", "error applying result", "pos", pos, "err", err)
-			}
-		}
-		return errors.Wrap(err, "error applying changes")
-	}
-
 	// test if the git working dir is clean
-	// TODO: move this up
 	workingDirClean, err := gitIsWorkingDirClean(ctx)
 	if err != nil {
 		return err
@@ -242,6 +263,23 @@ func (a *App) Run(ctx context.Context) error {
 				level.Info(a.logger).Log("msg", "Restored dirty working directory from stash")
 			}
 		}()
+	}
+
+	// apply changes from results
+	for _, result := range results {
+		if err := result.Apply(ctx); err != nil {
+			if merr, ok := err.(*multierror.Error); ok {
+				for pos, err := range merr.Errors {
+					level.Warn(a.logger).Log("msg", "error applying result", "pos", pos, "err", err)
+				}
+			}
+			return errors.Wrap(err, "error applying changes")
+		}
+	}
+
+	// write go mod
+	if err := goMod.Finish(ctx, a.cfg.VendorDirectory); err != nil {
+		return err
 	}
 
 	// create a new branch

@@ -1,37 +1,71 @@
 package gomod
 
 import (
-	"fmt"
+	"context"
 	"io/ioutil"
+	"path/filepath"
+	"sort"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 
 	"github.com/grafana/go-mod-promote/pkg/command"
+	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
 )
 
 type GoMod struct {
-	file *modfile.File
-	path string
+	file     *modfile.File
+	path     string
+	logger   log.Logger
+	replaces []Replace
 }
 
-func NewGoModFromPath(path string) (*GoMod, error) {
+type ReplacePriority int32
+
+const (
+	ReplacePriorityManagedPackage = ReplacePriority(1000)
+	ReplaceUpstreamPackageVersion = ReplacePriority(400)
+	ReplaceUpstreamReplace        = ReplacePriority(200)
+)
+
+type Replace struct {
+	modfile.Replace
+	// Higher Priority values overwrite lower priority ones
+	Priority ReplacePriority
+}
+
+func NewGoModFromContext(ctx context.Context) (*GoMod, error) {
+	logger := gmpctx.LoggerFromContext(ctx)
+	logger = log.With(logger, "module", "gomod")
+	path := filepath.Join(gmpctx.RootPathFromContext(ctx), "go.mod")
+
 	goModData, err := ioutil.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	goMod, err := modfile.ParseLax("go.mod", goModData, nil)
+	goMod, err := modfile.Parse("go.mod", goModData, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	return &GoMod{
-		file: goMod,
-		path: path,
+		file:   goMod,
+		path:   path,
+		logger: logger,
 	}, nil
 }
 
+func (g *GoMod) AddReplace(r Replace) error {
+	g.replaces = append(g.replaces, r)
+	return nil
+}
+
 func (g *GoMod) UpdatePackage(pkg, version string) error {
+	logger := log.With(g.logger, "pkg", pkg, "version", version)
+	level.Debug(logger).Log("msg", "update package")
 
 	if err := g.file.AddRequire(pkg, version); err != nil {
 		return err
@@ -45,18 +79,40 @@ func (g *GoMod) UpdatePackage(pkg, version string) error {
 	}
 
 	if replaceExists {
-		g.file.AddReplace(
-			pkg,
-			version,
-			pkg,
-			version,
-		)
+		level.Info(logger).Log("msg", "update existing replace statement")
+		if err := g.AddReplace(Replace{
+			Replace: modfile.Replace{
+				Old: module.Version{
+					Path: pkg,
+				},
+				New: module.Version{
+					Path:    pkg,
+					Version: version,
+				},
+			},
+		}); err != nil {
+			return err
+		}
 	}
 
-	return fmt.Errorf("todo %+v", g.file.Replace)
+	return nil
 }
 
-func (g *GoMod) Finish() error {
+func (g *GoMod) Finish(ctx context.Context, vendorEnabled bool) error {
+	// sort replaces by  TODO: evaluat
+	sort.Slice(g.replaces, func(i, j int) bool {
+		return g.replaces[i].Priority < g.replaces[j].Priority
+	})
+	for _, replace := range g.replaces {
+		if err := g.file.AddReplace(
+			replace.Old.Path,
+			replace.Old.Version,
+			replace.New.Path,
+			replace.New.Version,
+		); err != nil {
+			return err
+		}
+	}
 
 	data, err := g.file.Format()
 	if err != nil {
@@ -68,15 +124,16 @@ func (g *GoMod) Finish() error {
 		return err
 	}
 
-	// Run go mod tidy
-	if err := command.New(ctx, "go", "mod", "tidy").Run(); err != nil {
+	// Run go mod verify
+	if err := command.New(ctx, "go", "mod", "verify").Run(); err != nil {
 		return err
 	}
 
-	// Write vendor/
-	// TODO: Only do if configured to do
-	if err := command.New(ctx, "go", "mod", "vendor").Run(); err != nil {
-		return err
+	// Write vendor folder only do if configured to do so
+	if vendorEnabled {
+		if err := command.New(ctx, "go", "mod", "vendor").Run(); err != nil {
+			return err
+		}
 	}
 
 	return nil

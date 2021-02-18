@@ -20,6 +20,7 @@ import (
 	"github.com/grafana/go-mod-promote/pkg/command"
 	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
 	gmperr "github.com/grafana/go-mod-promote/pkg/errors"
+	"github.com/grafana/go-mod-promote/pkg/gomod"
 )
 
 type Patch struct {
@@ -146,6 +147,8 @@ type Result struct {
 	FilesToDelete []Delete // relative path to root
 
 	Patches []Patch
+
+	Replaces []gomod.Replace
 }
 
 func (r *Result) IsEmpty() bool {
@@ -156,6 +159,9 @@ func (r *Result) IsEmpty() bool {
 		return false
 	}
 	if len(r.Patches) > 0 {
+		return false
+	}
+	if len(r.Replaces) > 0 {
 		return false
 	}
 
@@ -203,6 +209,7 @@ func AggregateResult(results ...*Result) *Result {
 		aggregate.FilesToCopy = append(aggregate.FilesToCopy, r.FilesToCopy...)
 		aggregate.FilesToDelete = append(aggregate.FilesToDelete, r.FilesToDelete...)
 		aggregate.Patches = append(aggregate.Patches, r.Patches...)
+		aggregate.Replaces = append(aggregate.Replaces, r.Replaces...)
 	}
 
 	return &aggregate
@@ -213,10 +220,11 @@ type taskRunner interface {
 }
 
 type Task struct {
-	SyncDirectory *TaskSyncDirectory `yaml:"sync_directory"`
-	Diff          *TaskDiff          `yaml:"diff"`
-	GoModReplace  *TaskGoModReplace  `yaml:"go_mod_replace"`
-	Regexp        *TaskRegexp        `yaml:"regexp"`
+	SyncDirectory             *TaskSyncDirectory             `yaml:"sync_directory"`
+	Diff                      *TaskDiff                      `yaml:"diff"`
+	Regexp                    *TaskRegexp                    `yaml:"regexp"`
+	PinUpstreamPackageVersion *TaskPinUpstreamPackageVersion `yaml:"pin_upstream_package_version"`
+	ImportUpstreamReplaces    *TaskImportUpstreamReplaces    `yaml:"import_upstream_replaces"`
 }
 
 func (t *Task) Run(ctx context.Context) (*Result, error) {
@@ -230,8 +238,12 @@ func (t *Task) Run(ctx context.Context) (*Result, error) {
 		runners = append(runners, t.Diff)
 	}
 
-	if t.GoModReplace != nil {
-		runners = append(runners, t.GoModReplace)
+	if t.PinUpstreamPackageVersion != nil {
+		runners = append(runners, t.PinUpstreamPackageVersion)
+	}
+
+	if t.ImportUpstreamReplaces != nil {
+		runners = append(runners, t.ImportUpstreamReplaces)
 	}
 
 	if t.Regexp != nil {
@@ -288,6 +300,19 @@ func (t *TaskRegexp) run(ctx context.Context) (*Result, error) {
 	}
 
 	return nil, nil
+}
+
+type TaskPinUpstreamPackageVersion string
+
+func (t *TaskPinUpstreamPackageVersion) run(ctx context.Context) (*Result, error) {
+	return nil, gmperr.ErrNotImplemented{}
+}
+
+type TaskImportUpstreamReplaces struct {
+}
+
+func (t *TaskImportUpstreamReplaces) run(ctx context.Context) (*Result, error) {
+	return nil, gmperr.ErrNotImplemented{}
 }
 
 type TaskGoModReplace struct {

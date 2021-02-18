@@ -15,7 +15,11 @@ const (
 	contextKeyGoModAfter
 	contextKeyRootPath
 	contextKeyLogger
+	contextKeyGoModFile
 )
+
+type GoModFile interface {
+}
 
 func GoModBeforeIntoContext(ctx context.Context, b *api.GoModDownloadResult) context.Context {
 	return context.WithValue(ctx, contextKeyGoModBefore, b)
@@ -52,4 +56,12 @@ func LoggerFromContext(ctx context.Context) log.Logger {
 	}
 
 	return l
+}
+
+func GoModFileIntoContext(ctx context.Context, b GoModFile) context.Context {
+	return context.WithValue(ctx, contextKeyGoModFile, b)
+}
+
+func GoModFileFromContext(ctx context.Context) GoModFile {
+	return ctx.Value(contextKeyGoModFile).(GoModFile)
 }
