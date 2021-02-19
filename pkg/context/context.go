@@ -18,9 +18,6 @@ const (
 	contextKeyGoModFile
 )
 
-type GoModFile interface {
-}
-
 func GoModBeforeIntoContext(ctx context.Context, b *api.GoModDownloadResult) context.Context {
 	return context.WithValue(ctx, contextKeyGoModBefore, b)
 }
@@ -56,6 +53,10 @@ func LoggerFromContext(ctx context.Context) log.Logger {
 	}
 
 	return l
+}
+
+type GoModFile interface {
+	AddReplace(api.GoModReplace) error
 }
 
 func GoModFileIntoContext(ctx context.Context, b GoModFile) context.Context {

@@ -2,6 +2,7 @@ package gomod
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 
+	"github.com/grafana/go-mod-promote/pkg/api"
 	"github.com/grafana/go-mod-promote/pkg/command"
 	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
 )
@@ -19,28 +21,10 @@ type GoMod struct {
 	file     *modfile.File
 	path     string
 	logger   log.Logger
-	replaces []Replace
+	replaces []api.GoModReplace
 }
 
-type ReplacePriority int32
-
-const (
-	ReplacePriorityManagedPackage = ReplacePriority(1000)
-	ReplaceUpstreamPackageVersion = ReplacePriority(400)
-	ReplaceUpstreamReplace        = ReplacePriority(200)
-)
-
-type Replace struct {
-	modfile.Replace
-	// Higher Priority values overwrite lower priority ones
-	Priority ReplacePriority
-}
-
-func NewGoModFromContext(ctx context.Context) (*GoMod, error) {
-	logger := gmpctx.LoggerFromContext(ctx)
-	logger = log.With(logger, "module", "gomod")
-	path := filepath.Join(gmpctx.RootPathFromContext(ctx), "go.mod")
-
+func NewGoModFromPath(path string) (*GoMod, error) {
 	goModData, err := ioutil.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -54,11 +38,48 @@ func NewGoModFromContext(ctx context.Context) (*GoMod, error) {
 	return &GoMod{
 		file:   goMod,
 		path:   path,
-		logger: logger,
+		logger: log.NewNopLogger(),
 	}, nil
 }
 
-func (g *GoMod) AddReplace(r Replace) error {
+func NewGoModFromContext(ctx context.Context) (*GoMod, error) {
+	logger := gmpctx.LoggerFromContext(ctx)
+	logger = log.With(logger, "module", "gomod")
+	path := filepath.Join(gmpctx.RootPathFromContext(ctx), "go.mod")
+
+	goMod, err := NewGoModFromPath(path)
+	if err != nil {
+		return nil, err
+	}
+	goMod.logger = logger
+
+	return goMod, nil
+}
+
+func (g *GoMod) GetReplaces() []api.GoModReplace {
+	replaces := make([]api.GoModReplace, len(g.file.Replace))
+	for pos := range g.file.Replace {
+		replaces[pos].Replace = *g.file.Replace[pos]
+	}
+	return replaces
+}
+
+func (g *GoMod) GetVersionForPackage(pkg string) (string, error) {
+
+	for _, require := range g.file.Require {
+
+		if require.Mod.Path == pkg {
+			return require.Mod.Version, nil
+		}
+	}
+
+	return "", fmt.Errorf("package %s not found", pkg)
+
+}
+
+func (g *GoMod) AddReplace(r api.GoModReplace) error {
+	logger := log.With(g.logger, "pkg", r.New.Path, "version", r.New.Version)
+	level.Debug(logger).Log("msg", "added replace")
 	g.replaces = append(g.replaces, r)
 	return nil
 }
@@ -80,7 +101,7 @@ func (g *GoMod) UpdatePackage(pkg, version string) error {
 
 	if replaceExists {
 		level.Info(logger).Log("msg", "update existing replace statement")
-		if err := g.AddReplace(Replace{
+		if err := g.AddReplace(api.GoModReplace{
 			Replace: modfile.Replace{
 				Old: module.Version{
 					Path: pkg,
@@ -90,6 +111,7 @@ func (g *GoMod) UpdatePackage(pkg, version string) error {
 					Version: version,
 				},
 			},
+			Priority: api.GoModReplacePriorityManagedPackage,
 		}); err != nil {
 			return err
 		}
@@ -98,18 +120,46 @@ func (g *GoMod) UpdatePackage(pkg, version string) error {
 	return nil
 }
 
+func (g *GoMod) addReplace(input api.GoModReplace) error {
+	// add as normal
+	if err := g.file.AddReplace(input.Old.Path, input.Old.Version, input.New.Path, input.New.Version); err != nil {
+		return err
+	}
+
+	// if comment is empty we are finished
+	if input.Comment == "" {
+		return nil
+	}
+
+	// iterate throug entries
+
+	for _, r := range g.file.Replace {
+		if r.Old.Path == input.Old.Path && (input.Old.Version == "" || r.Old.Version == input.Old.Version) {
+
+			if r.Syntax == nil {
+				r.Syntax = &modfile.Line{}
+			}
+
+			r.Syntax.Before = []modfile.Comment{{
+				Token: "// [go-mod-promote] " + input.Comment,
+			}}
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("error entry was not found to add comment")
+}
+
 func (g *GoMod) Finish(ctx context.Context, vendorEnabled bool) error {
-	// sort replaces by  TODO: evaluat
+	// sort replaces by priority
 	sort.Slice(g.replaces, func(i, j int) bool {
 		return g.replaces[i].Priority < g.replaces[j].Priority
 	})
+
+	// add replaces as necessary
 	for _, replace := range g.replaces {
-		if err := g.file.AddReplace(
-			replace.Old.Path,
-			replace.Old.Version,
-			replace.New.Path,
-			replace.New.Version,
-		); err != nil {
+		if err := g.addReplace(replace); err != nil {
 			return err
 		}
 	}

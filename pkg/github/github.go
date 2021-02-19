@@ -35,7 +35,7 @@ func (g *GitHub) Username(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	return *user.Name, nil
+	return *user.Login, nil
 }
 
 func (g *GitHub) CreatePR(ctx context.Context, owner, repo string, newPR *NewPullRequest) (*PullRequest, error) {

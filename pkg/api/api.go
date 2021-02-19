@@ -3,6 +3,7 @@ package api
 import (
 	"strings"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
 
@@ -26,4 +27,21 @@ type GoModDownloadResult struct {
 	Path    string
 	Version GoModVersion
 	Dir     string
+}
+
+type GoModReplacePriority int32
+
+const (
+	GoModReplacePriorityManagedPackage = GoModReplacePriority(1000)
+	GoModReplaceUpstreamPackageVersion = GoModReplacePriority(400)
+	GoModReplaceUpstreamReplace        = GoModReplacePriority(200)
+)
+
+type GoModReplace struct {
+	modfile.Replace
+	// Higher Priority values overwrite lower priority ones
+	Priority GoModReplacePriority
+	// If Comment is not empty, go-mod-promote will actively manage the entry
+	// (e.g. remove it after it has been removed upstream)
+	Comment string
 }

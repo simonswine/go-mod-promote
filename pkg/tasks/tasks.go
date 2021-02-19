@@ -16,7 +16,10 @@ import (
 
 	"github.com/go-kit/kit/log/level"
 	"github.com/hashicorp/go-multierror"
+	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 
+	"github.com/grafana/go-mod-promote/pkg/api"
 	"github.com/grafana/go-mod-promote/pkg/command"
 	gmpctx "github.com/grafana/go-mod-promote/pkg/context"
 	gmperr "github.com/grafana/go-mod-promote/pkg/errors"
@@ -148,7 +151,7 @@ type Result struct {
 
 	Patches []Patch
 
-	Replaces []gomod.Replace
+	Replaces []api.GoModReplace
 }
 
 func (r *Result) IsEmpty() bool {
@@ -195,6 +198,14 @@ func (r *Result) Apply(ctx context.Context) error {
 			continue
 		}
 		level.Info(logger).Log("msg", fmt.Sprintf("copied '%s' successfully", toCopy))
+	}
+
+	goModFile := gmpctx.GoModFileFromContext(ctx)
+	for _, replace := range r.Replaces {
+		if err := goModFile.AddReplace(replace); err != nil {
+			result = multierror.Append(result, err)
+			continue
+		}
 	}
 
 	return result
@@ -305,14 +316,58 @@ func (t *TaskRegexp) run(ctx context.Context) (*Result, error) {
 type TaskPinUpstreamPackageVersion string
 
 func (t *TaskPinUpstreamPackageVersion) run(ctx context.Context) (*Result, error) {
-	return nil, gmperr.ErrNotImplemented{}
+	after := gmpctx.GoModAfterFromContext(ctx)
+
+	goModFile, err := gomod.NewGoModFromContext(gmpctx.RootPathIntoContext(ctx, after.Dir))
+	if err != nil {
+		return nil, err
+	}
+
+	pkg := string(*t)
+	version, err := goModFile.GetVersionForPackage(pkg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Result{
+		Replaces: []api.GoModReplace{{
+			Replace: modfile.Replace{
+				Old: module.Version{
+					Path: pkg,
+				},
+				New: module.Version{
+					Path:    pkg,
+					Version: version,
+				},
+			},
+			Priority: api.GoModReplacePriorityManagedPackage,
+			Comment:  fmt.Sprintf("pinned version from %s", after.Path),
+		}},
+	}, nil
 }
 
 type TaskImportUpstreamReplaces struct {
 }
 
 func (t *TaskImportUpstreamReplaces) run(ctx context.Context) (*Result, error) {
-	return nil, gmperr.ErrNotImplemented{}
+	after := gmpctx.GoModAfterFromContext(ctx)
+
+	goModFile, err := gomod.NewGoModFromContext(gmpctx.RootPathIntoContext(ctx, after.Dir))
+	if err != nil {
+		return nil, err
+	}
+
+	replaces := goModFile.GetReplaces()
+
+	comment := fmt.Sprintf("imported replace from %s", after.Path)
+
+	for pos := range replaces {
+		replaces[pos].Priority = api.GoModReplaceUpstreamReplace
+		replaces[pos].Comment = comment
+	}
+	return &Result{
+		Replaces: replaces,
+	}, nil
 }
 
 type TaskGoModReplace struct {
